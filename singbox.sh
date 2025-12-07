@@ -907,8 +907,40 @@ _add_hysteria2() {
     read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
     local node_ip=${custom_ip:-$server_ip}
     
-    read -p "请输入监听端口: " port; [[ -z "$port" ]] && _error "端口不能为空" && return 1
+    # --- [修改开始] 端口跳跃逻辑 ---
+    echo -e "请选择端口模式："
+    echo -e " 1) 单端口 (默认)"
+    echo -e " 2) 端口跳跃 (Port Hopping)"
+    read -p "请选择 [1-2]: " port_mode
     
+    local port=""
+    local hop_ports=""
+    
+    if [[ "$port_mode" == "2" ]]; then
+        read -p "请输入起始端口 (例如 20000): " port_start
+        read -p "请输入结束端口 (例如 30000): " port_end
+        [[ -z "$port_start" || -z "$port_end" ]] && _error "端口不能为空" && return 1
+        
+        # 将起始端口作为服务端实际监听的主端口
+        port=$port_start
+        hop_ports="${port_start}-${port_end}"
+        
+        _info "正在配置 iptables 端口转发 (UDP ${port_start}:${port_end} -> ${port})..."
+        # 尝试添加 iptables 规则 (NAT 表 PREROUTING 链)
+        if command -v iptables >/dev/null 2>&1; then
+            iptables -t nat -A PREROUTING -p udp --dport ${port_start}:${port_end} -j REDIRECT --to-ports ${port} 2>/dev/null
+            _success "已添加临时 iptables 规则。"
+            _warning "注意：请确保防火墙 (UFW/AWS Security Group) 已放行 UDP ${port_start}-${port_end}"
+            _warning "重启后 iptables 规则可能会失效，请自行配置持久化规则。"
+        else
+            _error "未找到 iptables 命令，端口跳跃服务端转发可能无法生效！"
+        fi
+    else
+        read -p "请输入监听端口: " port
+        [[ -z "$port" ]] && _error "端口不能为空" && return 1
+    fi
+    # --- [修改结束] ---
+
     read -p "请输入伪装域名 (默认: www.microsoft.com): " camouflage_domain
     local server_name=${camouflage_domain:-"www.microsoft.com"}
 
@@ -929,26 +961,35 @@ _add_hysteria2() {
         _info "已启用 Salamander 混淆。"
     fi
     
-    # [!] 新增：自定义名称
+    # 自定义名称
     local default_name="Hysteria2-${port}"
+    if [[ -n "$hop_ports" ]]; then default_name="Hy2-Hop-${hop_ports}"; fi
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name=${custom_name:-$default_name}
     
     local display_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && display_ip="[$node_ip]"
 
+    # Inbound 配置 (服务端始终监听主端口)
     local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg pw "$password" --arg op "$obfs_password" --arg cert "$cert_path" --arg key "$key_path" \
         '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}} | if $op != "" then .obfs={"type":"salamander","password":$op} else . end')
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]" || return 1
     
-    local meta_json=$(jq -n --arg up "$up_speed" --arg down "$down_speed" --arg op "$obfs_password" \
-        '{ "up": $up, "down": $down } | if $op != "" then .obfsPassword = $op else . end')
+    # Metadata 配置 (保存 hop_ports 信息)
+    local meta_json=$(jq -n --arg up "$up_speed" --arg down "$down_speed" --arg op "$obfs_password" --arg hp "$hop_ports" \
+        '{ "up": $up, "down": $down } | if $op != "" then .obfsPassword = $op else . end | if $hp != "" then .ports = $hp else . end')
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
 
-    local proxy_json=$(jq -n --arg n "$name" --arg s "$display_ip" --arg p "$port" --arg pw "$password" --arg sn "$server_name" --arg up "$up_speed" --arg down "$down_speed" --arg op "$obfs_password" \
-        '{"name":$n,"type":"hysteria2","server":$s,"port":($p|tonumber),"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"up":$up,"down":$down} | if $op != "" then .obfs="salamander" | .["obfs-password"]=$op else . end')
+    # Proxy 配置 (Clash Meta 格式支持 ports 字段)
+    local proxy_json=$(jq -n --arg n "$name" --arg s "$display_ip" --arg p "$port" --arg pw "$password" --arg sn "$server_name" --arg up "$up_speed" --arg down "$down_speed" --arg op "$obfs_password" --arg hp "$hop_ports" \
+        '{"name":$n,"type":"hysteria2","server":$s,"port":($p|tonumber),"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"up":$up,"down":$down} 
+        | if $op != "" then .obfs="salamander" | .["obfs-password"]=$op else . end 
+        | if $hp != "" then .ports = $hp end')
     _add_node_to_yaml "$proxy_json"
     
     _success "Hysteria2 节点 [${name}] 添加成功!"
+    if [[ -n "$hop_ports" ]]; then
+        _info "端口跳跃已启用: ${hop_ports} (主端口: ${port})"
+    fi
 }
 
 _add_tuic() {
@@ -1062,81 +1103,59 @@ _view_nodes() {
     jq -c '.inbounds[]' "$CONFIG_FILE" | while read -r node; do
         local tag=$(echo "$node" | jq -r '.tag') type=$(echo "$node" | jq -r '.type') port=$(echo "$node" | jq -r '.listen_port')
         
-        # 优化查找逻辑：优先使用端口匹配，因为tag和name可能不完全对应
+        # 查找名称逻辑 (保持原样)
         local proxy_name_to_find=""
         local proxy_obj_by_port=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}')' ${CLASH_YAML_FILE} | head -n 1)
-
         if [ -n "$proxy_obj_by_port" ]; then
              proxy_name_to_find=$(echo "$proxy_obj_by_port" | ${YQ_BINARY} eval '.name' -)
         fi
-
-        # 如果通过端口找不到（比如443端口被复用），则尝试用类型模糊匹配
         if [[ -z "$proxy_name_to_find" ]]; then
             proxy_name_to_find=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}' or .port == 443) | .name' ${CLASH_YAML_FILE} | grep -i "${type}" | head -n 1)
         fi
-        
-        # 再次降级，如果还找不到
         if [[ -z "$proxy_name_to_find" ]]; then
              proxy_name_to_find=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}' or .port == 443) | .name' ${CLASH_YAML_FILE} | head -n 1)
         fi
 
-        # [!] 已修改：创建一个显示名称，优先使用clash.yaml中的名称，失败则回退到tag
         local display_name=${proxy_name_to_find:-$tag}
-
-        # 优先使用 metadata.json 中的 IP (用于 REALITY 和 TCP)
         local display_server=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .server' ${CLASH_YAML_FILE} | head -n 1)
-        # 移除方括号
         local display_ip=$(echo "$display_server" | tr -d '[]')
         
         echo "-------------------------------------"
-        # [!] 已修改：使用 display_name
         _info " 节点: ${display_name}"
         local url=""
         case "$type" in
             "vless")
+                # VLESS 逻辑保持不变...
                 local uuid=$(echo "$node" | jq -r '.users[0].uuid')
                 local transport_type=$(echo "$node" | jq -r '.transport.type')
-
                 if [ "$transport_type" == "ws" ]; then
-                    # VLESS + WS + TLS
                     local server_addr=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .server' ${CLASH_YAML_FILE} | head -n 1)
                     local host_header=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .ws-opts.headers.Host' ${CLASH_YAML_FILE} | head -n 1)
                     local client_port=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .port' ${CLASH_YAML_FILE} | head -n 1)
                     local ws_path=$(echo "$node" | jq -r '.transport.path')
                     local encoded_path=$(_url_encode "$ws_path")
-                    # [!] 已修改：使用 display_name
                     url="vless://${uuid}@${server_addr}:${client_port}?encryption=none&security=tls&type=ws&host=${host_header}&path=${encoded_path}#$(_url_encode "$display_name")"
                 elif [ "$(echo "$node" | jq -r '.tls.reality.enabled')" == "true" ]; then
-                    # VLESS + REALITY
                     local sn=$(echo "$node" | jq -r '.tls.server_name'); local flow=$(echo "$node" | jq -r '.users[0].flow')
                     local meta=$(jq -r --arg t "$tag" '.[$t]' "$METADATA_FILE"); local pk=$(echo "$meta" | jq -r '.publicKey'); local sid=$(echo "$meta" | jq -r '.shortId')
-                    # [!] 已修改：使用 display_name
                     url="vless://${uuid}@${display_ip}:${port}?encryption=none&security=reality&type=tcp&sni=${sn}&fp=chrome&flow=${flow}&pbk=${pk}&sid=${sid}#$(_url_encode "$display_name")"
                 else
-                    # VLESS + TCP
-                    # [!] 已修改：使用 display_name
                     url="vless://${uuid}@${display_ip}:${port}?type=tcp&security=none#$(_url_encode "$display_name")"
                 fi
                 ;;
-            
-            # [!!!] 新增 TROJAN 支持
             "trojan")
+                # Trojan 逻辑保持不变...
                 local password=$(echo "$node" | jq -r '.users[0].password')
                 local transport_type=$(echo "$node" | jq -r '.transport.type')
-
                 if [ "$transport_type" == "ws" ]; then
-                    # Trojan + WS + TLS
                     local server_addr=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .server' ${CLASH_YAML_FILE} | head -n 1)
                     local host_header=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .ws-opts.headers.Host' ${CLASH_YAML_FILE} | head -n 1)
                     local client_port=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .port' ${CLASH_YAML_FILE} | head -n 1)
                     local ws_path=$(echo "$node" | jq -r '.transport.path')
                     local encoded_path=$(_url_encode "$ws_path")
                     local sni=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .servername' ${CLASH_YAML_FILE} | head -n 1)
-                    
-                    # [!] 已修改：使用 display_name
                     url="trojan://$(_url_encode "$password")@${server_addr}:${client_port}?encryption=none&security=tls&type=ws&host=${host_header}&path=${encoded_path}&sni=${sni}#$(_url_encode "$display_name")"
                 else
-                    # Trojan (TCP)
                     _info "  类型: Trojan (TCP), 地址: $display_server, 端口: $port, 密码: [已隐藏]"
                 fi
                 ;;
@@ -1145,25 +1164,31 @@ _view_nodes() {
                 local pw=$(echo "$node" | jq -r '.users[0].password');
                 local sn=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .sni' ${CLASH_YAML_FILE} | head -n 1)
                 local meta=$(jq -r --arg t "$tag" '.[$t]' "$METADATA_FILE");
+                
+                # --- [修改开始] 读取 metadata 中的混淆和端口跳跃 ---
                 local op=$(echo "$meta" | jq -r '.obfsPassword')
-                local obfs_param=""; [[ -n "$op" && "$op" != "null" ]] && obfs_param="&obfs=salamander&obfs-password=${op}"
-                # [!] 已修改：使用 display_name
-                url="hysteria2://${pw}@${display_ip}:${port}?sni=${sn}&insecure=1${obfs_param}#$(_url_encode "$display_name")"
+                local hp=$(echo "$meta" | jq -r '.ports')
+                
+                local extra_param="&insecure=1"
+                [[ -n "$op" && "$op" != "null" ]] && extra_param="${extra_param}&obfs=salamander&obfs-password=${op}"
+                [[ -n "$hp" && "$hp" != "null" ]] && extra_param="${extra_param}&mport=${hp}"
+                
+                url="hysteria2://${pw}@${display_ip}:${port}?sni=${sn}${extra_param}#$(_url_encode "$display_name")"
+                # --- [修改结束] ---
                 ;;
             "tuic")
+                # TUIC 逻辑保持不变...
                 local uuid=$(echo "$node" | jq -r '.users[0].uuid'); local pw=$(echo "$node" | jq -r '.users[0].password')
                 local sn=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .sni' ${CLASH_YAML_FILE} | head -n 1)
-                # [!] 已修改：使用 display_name
                 url="tuic://${uuid}:${pw}@${display_ip}:${port}?sni=${sn}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$display_name")"
                 ;;
             "shadowsocks")
+                # SS 逻辑保持不变...
                 local m=$(echo "$node" | jq -r '.method'); local pw=$(echo "$node" | jq -r '.password')
                 if [[ "$m" == "2022-blake3-aes-128-gcm" ]]; then
-                     # [!] 已修改：使用 display_name
                      url="ss://$(_url_encode "${m}:${pw}")@${display_ip}:${port}#$(_url_encode "$display_name")"
                 else
                     local b64=$(echo -n "${m}:${pw}" | base64 | tr -d '\n')
-                    # [!] 已修改：使用 display_name
                     url="ss://${b64}@${display_ip}:${port}#$(_url_encode "$display_name")"
                 fi
                 ;;
