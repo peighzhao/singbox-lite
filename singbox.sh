@@ -1225,7 +1225,46 @@ _view_nodes() {
             "hysteria2")
                 local pw=$(echo "$node" | jq -r '.users[0].password');
                 # 获取 SNI，如果 yq 失败则尝试从 node 直接获取
+                local sn=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .sni' ${CLASH_YAML_FILE} | head -n 1)
+                # 兜底 SNI：如果 clash 文件里没读到，尝试读 config.json 的 tls.server_name (虽然 hy2 通常不写在 inbound 的 server_name 字段，但 metadata 可能有记录，这里简单处理)
+                if [[ -z "$sn" || "$sn" == "null" ]]; then
+                     # 尝试硬兜底，如果是 null 链接就不好看了，但至少比 null 好
+                     sn="" 
+                fi
 
+                local meta=$(jq -r --arg t "$tag" '.[$t]' "$METADATA_FILE");
+                local op=$(echo "$meta" | jq -r '.obfsPassword')
+                local hp=$(echo "$meta" | jq -r '.ports')
+                
+                local extra_param="&insecure=1"
+                [[ -n "$op" && "$op" != "null" ]] && extra_param="${extra_param}&obfs=salamander&obfs-password=${op}"
+                [[ -n "$hp" && "$hp" != "null" ]] && extra_param="${extra_param}&mport=${hp}"
+                
+                url="hysteria2://${pw}@${display_ip}:${port}?sni=${sn}${extra_param}#$(_url_encode "$display_name")"
+                ;;
+            "tuic")
+                local uuid=$(echo "$node" | jq -r '.users[0].uuid'); local pw=$(echo "$node" | jq -r '.users[0].password')
+                local sn=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .sni' ${CLASH_YAML_FILE} | head -n 1)
+                url="tuic://${uuid}:${pw}@${display_ip}:${port}?sni=${sn}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$display_name")"
+                ;;
+            "shadowsocks")
+                local m=$(echo "$node" | jq -r '.method'); local pw=$(echo "$node" | jq -r '.password')
+                if [[ "$m" == "2022-blake3-aes-128-gcm" ]]; then
+                     url="ss://$(_url_encode "${m}:${pw}")@${display_ip}:${port}#$(_url_encode "$display_name")"
+                else
+                    local b64=$(echo -n "${m}:${pw}" | base64 | tr -d '\n')
+                    url="ss://${b64}@${display_ip}:${port}#$(_url_encode "$display_name")"
+                fi
+                ;;
+            "socks")
+                local u=$(echo "$node" | jq -r '.users[0].username'); local p=$(echo "$node" | jq -r '.users[0].password')
+                _info "  类型: SOCKS5, 地址: $display_server, 端口: $port, 用户: $u, 密码: $p"
+                ;;
+        esac
+        [ -n "$url" ] && echo -e "  ${YELLOW}分享链接:${NC} ${url}"
+    done
+    echo "-------------------------------------"
+}
 _delete_node() {
     if ! jq -e '.inbounds | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then _warning "当前没有任何节点。"; return; fi
     _info "--- 节点删除 ---"
