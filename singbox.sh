@@ -907,7 +907,7 @@ _add_hysteria2() {
     read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
     local node_ip=${custom_ip:-$server_ip}
     
-    # --- [修改开始] 端口跳跃逻辑 ---
+    # --- [修改开始] 端口跳跃逻辑 (原生版，无需 iptables) ---
     echo -e "请选择端口模式："
     echo -e " 1) 单端口 (默认)"
     echo -e " 2) 端口跳跃 (Port Hopping)"
@@ -921,20 +921,13 @@ _add_hysteria2() {
         read -p "请输入结束端口 (例如 30000): " port_end
         [[ -z "$port_start" || -z "$port_end" ]] && _error "端口不能为空" && return 1
         
-        # 将起始端口作为服务端实际监听的主端口
-        port=$port_start
+        # 记录范围，用于 server_ports
         hop_ports="${port_start}-${port_end}"
+        # 逻辑上我们将起始端口视为主端口用于显示，但实际上 Sing-box 会监听整个范围
+        port=$port_start
         
-        _info "正在配置 iptables 端口转发 (UDP ${port_start}:${port_end} -> ${port})..."
-        # 尝试添加 iptables 规则 (NAT 表 PREROUTING 链)
-        if command -v iptables >/dev/null 2>&1; then
-            iptables -t nat -A PREROUTING -p udp --dport ${port_start}:${port_end} -j REDIRECT --to-ports ${port} 2>/dev/null
-            _success "已添加临时 iptables 规则。"
-            _warning "注意：请确保防火墙 (UFW/AWS Security Group) 已放行 UDP ${port_start}-${port_end}"
-            _warning "重启后 iptables 规则可能会失效，请自行配置持久化规则。"
-        else
-            _error "未找到 iptables 命令，端口跳跃服务端转发可能无法生效！"
-        fi
+        _info "已启用原生端口跳跃: ${hop_ports}"
+        _warning "请确保防火墙 (AWS/阿里云安全组/UFW) 已放行 UDP ${port_start}-${port_end}"
     else
         read -p "请输入监听端口: " port
         [[ -z "$port" ]] && _error "端口不能为空" && return 1
@@ -969,17 +962,27 @@ _add_hysteria2() {
     
     local display_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && display_ip="[$node_ip]"
 
-    # Inbound 配置 (服务端始终监听主端口)
-    local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg pw "$password" --arg op "$obfs_password" --arg cert "$cert_path" --arg key "$key_path" \
-        '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}} | if $op != "" then .obfs={"type":"salamander","password":$op} else . end')
+    # --- [关键修改] 生成 Inbound JSON ---
+    # 如果有 hop_ports，使用 server_ports 字段；否则使用 listen_port 字段
+    local inbound_json
+    if [[ -n "$hop_ports" ]]; then
+        # 原生跳跃配置：注意 server_ports 是数组 ["start-end"]
+        inbound_json=$(jq -n --arg t "$tag" --arg hp "$hop_ports" --arg pw "$password" --arg op "$obfs_password" --arg cert "$cert_path" --arg key "$key_path" \
+            '{"type":"hysteria2","tag":$t,"listen":"::","server_ports":[$hp],"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}} | if $op != "" then .obfs={"type":"salamander","password":$op} else . end')
+    else
+        # 传统单端口配置
+        inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg pw "$password" --arg op "$obfs_password" --arg cert "$cert_path" --arg key "$key_path" \
+            '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}} | if $op != "" then .obfs={"type":"salamander","password":$op} else . end')
+    fi
+    
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]" || return 1
     
-    # Metadata 配置 (保存 hop_ports 信息)
+    # Metadata 配置 (保持不变，用于显示链接)
     local meta_json=$(jq -n --arg up "$up_speed" --arg down "$down_speed" --arg op "$obfs_password" --arg hp "$hop_ports" \
         '{ "up": $up, "down": $down } | if $op != "" then .obfsPassword = $op else . end | if $hp != "" then .ports = $hp else . end')
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
 
-    # Proxy 配置 (Clash Meta 格式支持 ports 字段)
+    # Proxy 配置 (Clash Meta)
     local proxy_json=$(jq -n --arg n "$name" --arg s "$display_ip" --arg p "$port" --arg pw "$password" --arg sn "$server_name" --arg up "$up_speed" --arg down "$down_speed" --arg op "$obfs_password" --arg hp "$hop_ports" \
         '{"name":$n,"type":"hysteria2","server":$s,"port":($p|tonumber),"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"up":$up,"down":$down} 
         | if $op != "" then .obfs="salamander" | .["obfs-password"]=$op else . end 
@@ -988,9 +991,10 @@ _add_hysteria2() {
     
     _success "Hysteria2 节点 [${name}] 添加成功!"
     if [[ -n "$hop_ports" ]]; then
-        _info "端口跳跃已启用: ${hop_ports} (主端口: ${port})"
+        _info "端口跳跃已启用: ${hop_ports}"
     fi
 }
+
 
 _add_tuic() {
     read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
