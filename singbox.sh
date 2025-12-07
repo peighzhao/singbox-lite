@@ -907,9 +907,9 @@ _add_hysteria2() {
     read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
     local node_ip=${custom_ip:-$server_ip}
     
-    # --- [修改开始] 端口跳跃逻辑 (原生版，无需 iptables) ---
+    # --- 端口配置逻辑 ---
     echo -e "请选择端口模式："
-    echo -e " 1) 单端口 (默认)"
+    echo -e " 1) 单端口"
     echo -e " 2) 端口跳跃 (Port Hopping)"
     read -p "请选择 [1-2]: " port_mode
     
@@ -917,26 +917,43 @@ _add_hysteria2() {
     local hop_ports=""
     
     if [[ "$port_mode" == "2" ]]; then
-        read -p "请输入起始端口 (例如 20000): " port_start
-        read -p "请输入结束端口 (例如 30000): " port_end
-        [[ -z "$port_start" || -z "$port_end" ]] && _error "端口不能为空" && return 1
+        # 端口跳跃模式：强制输入起始和结束端口，无默认值
+        read -p "请输入起始端口 (必填，例如 20000): " port_start
+        read -p "请输入结束端口 (必填，例如 30000): " port_end
         
-        # 记录范围，用于 server_ports
+        if [[ -z "$port_start" || -z "$port_end" ]]; then
+            _error "错误：端口跳跃模式下，起始和结束端口都不能为空！"
+            return 1
+        fi
+        
+        # 检查结束端口是否大于起始端口
+        if [[ "$port_end" -le "$port_start" ]]; then
+             _error "错误：结束端口必须大于起始端口！"
+             return 1
+        fi
+
+        # 记录范围
         hop_ports="${port_start}-${port_end}"
-        # 逻辑上我们将起始端口视为主端口用于显示，但实际上 Sing-box 会监听整个范围
+        # 记录起始端口用于文件名标记和 URL 显示，但在配置文件中将使用 server_ports
         port=$port_start
         
         _info "已启用原生端口跳跃: ${hop_ports}"
-        _warning "请确保防火墙 (AWS/阿里云安全组/UFW) 已放行 UDP ${port_start}-${port_end}"
+        _warning "请务必确保防火墙 (UDP) 已放行端口范围: ${hop_ports}"
     else
-        read -p "请输入监听端口: " port
-        [[ -z "$port" ]] && _error "端口不能为空" && return 1
+        # 单端口模式：强制输入，无默认值
+        read -p "请输入监听端口 (必填): " input_port
+        if [[ -z "$input_port" ]]; then
+            _error "错误：监听端口不能为空！"
+            return 1
+        fi
+        port=$input_port
     fi
-    # --- [修改结束] ---
+    # -------------------
 
     read -p "请输入伪装域名 (默认: www.microsoft.com): " camouflage_domain
     local server_name=${camouflage_domain:-"www.microsoft.com"}
 
+    # 标签和文件名使用单端口或起始端口命名，保持简洁
     local tag="hy2-in-${port}"
     local cert_path="${SINGBOX_DIR}/${tag}.pem"
     local key_path="${SINGBOX_DIR}/${tag}.key"
@@ -954,7 +971,7 @@ _add_hysteria2() {
         _info "已启用 Salamander 混淆。"
     fi
     
-    # 自定义名称
+    # 自定义名称逻辑
     local default_name="Hysteria2-${port}"
     if [[ -n "$hop_ports" ]]; then default_name="Hy2-Hop-${hop_ports}"; fi
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
@@ -962,27 +979,30 @@ _add_hysteria2() {
     
     local display_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && display_ip="[$node_ip]"
 
-    # --- [关键修改] 生成 Inbound JSON ---
-    # 如果有 hop_ports，使用 server_ports 字段；否则使用 listen_port 字段
+    # --- 生成 Inbound JSON ---
+    # 严格区分：有 hop_ports 则只写 server_ports，否则只写 listen_port
     local inbound_json
     if [[ -n "$hop_ports" ]]; then
-        # 原生跳跃配置：注意 server_ports 是数组 ["start-end"]
+        # [端口跳跃模式] 使用 server_ports (字符串数组)
         inbound_json=$(jq -n --arg t "$tag" --arg hp "$hop_ports" --arg pw "$password" --arg op "$obfs_password" --arg cert "$cert_path" --arg key "$key_path" \
             '{"type":"hysteria2","tag":$t,"listen":"::","server_ports":[$hp],"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}} | if $op != "" then .obfs={"type":"salamander","password":$op} else . end')
     else
-        # 传统单端口配置
+        # [单端口模式] 使用 listen_port (数字)
         inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg pw "$password" --arg op "$obfs_password" --arg cert "$cert_path" --arg key "$key_path" \
             '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}} | if $op != "" then .obfs={"type":"salamander","password":$op} else . end')
     fi
     
+    # 写入 config.json
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]" || return 1
     
-    # Metadata 配置 (保持不变，用于显示链接)
+    # --- 生成 Metadata ---
+    # 将端口范围信息保存到 metadata，供 _view_nodes 查看链接时使用
     local meta_json=$(jq -n --arg up "$up_speed" --arg down "$down_speed" --arg op "$obfs_password" --arg hp "$hop_ports" \
         '{ "up": $up, "down": $down } | if $op != "" then .obfsPassword = $op else . end | if $hp != "" then .ports = $hp else . end')
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
 
-    # Proxy 配置 (Clash Meta)
+    # --- 生成 Clash Meta 配置 ---
+    # Clash Meta 使用 ports: "x-y" 格式来表示范围
     local proxy_json=$(jq -n --arg n "$name" --arg s "$display_ip" --arg p "$port" --arg pw "$password" --arg sn "$server_name" --arg up "$up_speed" --arg down "$down_speed" --arg op "$obfs_password" --arg hp "$hop_ports" \
         '{"name":$n,"type":"hysteria2","server":$s,"port":($p|tonumber),"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"up":$up,"down":$down} 
         | if $op != "" then .obfs="salamander" | .["obfs-password"]=$op else . end 
@@ -991,9 +1011,10 @@ _add_hysteria2() {
     
     _success "Hysteria2 节点 [${name}] 添加成功!"
     if [[ -n "$hop_ports" ]]; then
-        _info "端口跳跃已启用: ${hop_ports}"
+        _info "端口跳跃配置已生效: ${hop_ports}"
     fi
 }
+
 
 
 _add_tuic() {
