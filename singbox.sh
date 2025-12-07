@@ -1120,39 +1120,74 @@ _add_socks() {
     _add_node_to_yaml "$proxy_json"
     _success "SOCKS5 节点添加成功!"
 }
-
 _view_nodes() {
     if ! jq -e '.inbounds | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then _warning "当前没有任何节点。"; return; fi
     
     _info "--- 当前节点信息 (共 $(jq '.inbounds | length' "$CONFIG_FILE") 个) ---"
+    
+    # 使用 while read 循环处理每一个节点
     jq -c '.inbounds[]' "$CONFIG_FILE" | while read -r node; do
-        local tag=$(echo "$node" | jq -r '.tag') type=$(echo "$node" | jq -r '.type') port=$(echo "$node" | jq -r '.listen_port')
+        local tag=$(echo "$node" | jq -r '.tag') 
+        local type=$(echo "$node" | jq -r '.type') 
         
-        # 查找名称逻辑 (保持原样)
+        # --- [关键修复 1]：智能获取端口 ---
+        # 先尝试读取 listen_port
+        local port=$(echo "$node" | jq -r '.listen_port')
+        
+        # 如果是 null (说明是端口跳跃模式，使用了 server_ports)，则解析 server_ports
+        if [[ "$port" == "null" ]]; then
+            # 提取 server_ports 数组的第一个元素 (例如 "20000-30000")
+            local port_range=$(echo "$node" | jq -r '.server_ports[0] // empty')
+            if [[ -n "$port_range" ]]; then
+                # 截取 "-" 前面的部分作为起始端口 (例如 20000)
+                port=$(echo "$port_range" | cut -d'-' -f1)
+            fi
+        fi
+        
+        # 如果端口依然获取失败，跳过此节点防止报错
+        if [[ -z "$port" || "$port" == "null" ]]; then
+            _error "无法解析节点端口，跳过: $tag"
+            continue
+        fi
+        # -----------------------------------
+        
+        # 优化查找逻辑：优先使用端口匹配
         local proxy_name_to_find=""
         local proxy_obj_by_port=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}')' ${CLASH_YAML_FILE} | head -n 1)
+
         if [ -n "$proxy_obj_by_port" ]; then
              proxy_name_to_find=$(echo "$proxy_obj_by_port" | ${YQ_BINARY} eval '.name' -)
         fi
+
         if [[ -z "$proxy_name_to_find" ]]; then
             proxy_name_to_find=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}' or .port == 443) | .name' ${CLASH_YAML_FILE} | grep -i "${type}" | head -n 1)
         fi
+        
         if [[ -z "$proxy_name_to_find" ]]; then
              proxy_name_to_find=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}' or .port == 443) | .name' ${CLASH_YAML_FILE} | head -n 1)
         fi
 
         local display_name=${proxy_name_to_find:-$tag}
+
+        # 获取 IP
         local display_server=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .server' ${CLASH_YAML_FILE} | head -n 1)
+        # 移除可能存在的 IPv6 方括号
         local display_ip=$(echo "$display_server" | tr -d '[]')
         
+        # --- [关键修复 2]：兜底 IP ---
+        # 如果 clash.yaml 里没查到 IP (极端情况)，使用全局变量 server_ip
+        if [[ -z "$display_ip" || "$display_ip" == "null" ]]; then
+            display_ip=${server_ip}
+        fi
+
         echo "-------------------------------------"
         _info " 节点: ${display_name}"
         local url=""
         case "$type" in
             "vless")
-                # VLESS 逻辑保持不变...
                 local uuid=$(echo "$node" | jq -r '.users[0].uuid')
                 local transport_type=$(echo "$node" | jq -r '.transport.type')
+
                 if [ "$transport_type" == "ws" ]; then
                     local server_addr=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .server' ${CLASH_YAML_FILE} | head -n 1)
                     local host_header=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .ws-opts.headers.Host' ${CLASH_YAML_FILE} | head -n 1)
@@ -1168,10 +1203,11 @@ _view_nodes() {
                     url="vless://${uuid}@${display_ip}:${port}?type=tcp&security=none#$(_url_encode "$display_name")"
                 fi
                 ;;
+            
             "trojan")
-                # Trojan 逻辑保持不变...
                 local password=$(echo "$node" | jq -r '.users[0].password')
                 local transport_type=$(echo "$node" | jq -r '.transport.type')
+
                 if [ "$transport_type" == "ws" ]; then
                     local server_addr=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .server' ${CLASH_YAML_FILE} | head -n 1)
                     local host_header=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .ws-opts.headers.Host' ${CLASH_YAML_FILE} | head -n 1)
@@ -1179,6 +1215,7 @@ _view_nodes() {
                     local ws_path=$(echo "$node" | jq -r '.transport.path')
                     local encoded_path=$(_url_encode "$ws_path")
                     local sni=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .servername' ${CLASH_YAML_FILE} | head -n 1)
+                    
                     url="trojan://$(_url_encode "$password")@${server_addr}:${client_port}?encryption=none&security=tls&type=ws&host=${host_header}&path=${encoded_path}&sni=${sni}#$(_url_encode "$display_name")"
                 else
                     _info "  类型: Trojan (TCP), 地址: $display_server, 端口: $port, 密码: [已隐藏]"
@@ -1187,45 +1224,7 @@ _view_nodes() {
 
             "hysteria2")
                 local pw=$(echo "$node" | jq -r '.users[0].password');
-                local sn=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .sni' ${CLASH_YAML_FILE} | head -n 1)
-                local meta=$(jq -r --arg t "$tag" '.[$t]' "$METADATA_FILE");
-                
-                # --- [修改开始] 读取 metadata 中的混淆和端口跳跃 ---
-                local op=$(echo "$meta" | jq -r '.obfsPassword')
-                local hp=$(echo "$meta" | jq -r '.ports')
-                
-                local extra_param="&insecure=1"
-                [[ -n "$op" && "$op" != "null" ]] && extra_param="${extra_param}&obfs=salamander&obfs-password=${op}"
-                [[ -n "$hp" && "$hp" != "null" ]] && extra_param="${extra_param}&mport=${hp}"
-                
-                url="hysteria2://${pw}@${display_ip}:${port}?sni=${sn}${extra_param}#$(_url_encode "$display_name")"
-                # --- [修改结束] ---
-                ;;
-            "tuic")
-                # TUIC 逻辑保持不变...
-                local uuid=$(echo "$node" | jq -r '.users[0].uuid'); local pw=$(echo "$node" | jq -r '.users[0].password')
-                local sn=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .sni' ${CLASH_YAML_FILE} | head -n 1)
-                url="tuic://${uuid}:${pw}@${display_ip}:${port}?sni=${sn}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$display_name")"
-                ;;
-            "shadowsocks")
-                # SS 逻辑保持不变...
-                local m=$(echo "$node" | jq -r '.method'); local pw=$(echo "$node" | jq -r '.password')
-                if [[ "$m" == "2022-blake3-aes-128-gcm" ]]; then
-                     url="ss://$(_url_encode "${m}:${pw}")@${display_ip}:${port}#$(_url_encode "$display_name")"
-                else
-                    local b64=$(echo -n "${m}:${pw}" | base64 | tr -d '\n')
-                    url="ss://${b64}@${display_ip}:${port}#$(_url_encode "$display_name")"
-                fi
-                ;;
-            "socks")
-                local u=$(echo "$node" | jq -r '.users[0].username'); local p=$(echo "$node" | jq -r '.users[0].password')
-                _info "  类型: SOCKS5, 地址: $display_server, 端口: $port, 用户: $u, 密码: $p"
-                ;;
-        esac
-        [ -n "$url" ] && echo -e "  ${YELLOW}分享链接:${NC} ${url}"
-    done
-    echo "-------------------------------------"
-}
+                # 获取 SNI，如果 yq 失败则尝试从 node 直接获取
 
 _delete_node() {
     if ! jq -e '.inbounds | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then _warning "当前没有任何节点。"; return; fi
